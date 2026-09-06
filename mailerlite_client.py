@@ -1,296 +1,235 @@
-"""HTTP client for MailerLite (C30. Email Marketing & Newsletter)."""
+"""Official MailerLite REST API client aligned with connect.mailerlite.com/api."""
 from __future__ import annotations
 import httpx
 from typing import Any, Optional
 
-DEFAULT_BASE = "https://api.mailerlite.com"
+DEFAULT_MAILERLITE_BASE = "https://connect.mailerlite.com/api"
 
 class MailerLiteClient:
     def __init__(self, api_key: str, base_url: str = ""):
-        self.token = api_key
-        self.base_url = (base_url.strip() if base_url else DEFAULT_BASE).rstrip("/")
+        self.api_key = api_key.strip()
+        self.base_url = (base_url.strip() if base_url else DEFAULT_MAILERLITE_BASE).rstrip("/")
         self.headers = {
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "Imperal-mailerlite/0.1.0"
+            "User-Agent": "Imperal-MailerLite/0.1.0"
         }
         self.timeout = httpx.Timeout(30.0, connect=10.0)
 
-    async def verify_auth(self) -> dict[str, Any]:
+    def _sanitize_msg(self, msg: str) -> str:
+        if not msg:
+            return ""
+        if self.api_key and len(self.api_key) > 6:
+            msg = msg.replace(self.api_key, self.api_key[:3] + "..." + self.api_key[-3:])
+        return msg
+
+    def _classify_error(self, resp: httpx.Response, action_name: str) -> dict[str, Any]:
+        status = resp.status_code
+        err_msg = ""
+        try:
+            data = resp.json()
+            if "errors" in data and isinstance(data["errors"], dict):
+                err_msg = "; ".join(f"{k}: {', '.join(v) if isinstance(v, list) else str(v)}" for k, v in data["errors"].items())
+            elif "message" in data:
+                err_msg = data["message"]
+            elif "error" in data:
+                err_msg = str(data["error"])
+        except Exception:
+            err_msg = resp.text[:200]
+        err_msg = self._sanitize_msg(err_msg)
+
+        if status == 429:
+            retry_after = resp.headers.get("Retry-After", "60")
+            return {
+                "status": "error",
+                "code": "RATE_LIMITED",
+                "message": f"MailerLite rate limit exceeded on {action_name}. Retry after {retry_after}s. Details: {err_msg}",
+                "retry_after": int(retry_after) if retry_after.isdigit() else 60
+            }
+        elif status == 401:
+            return {
+                "status": "error",
+                "code": "UNAUTHORIZED",
+                "message": f"MailerLite authentication failed on {action_name}. API key invalid or expired."
+            }
+        elif status == 403:
+            return {
+                "status": "error",
+                "code": "FORBIDDEN",
+                "message": f"Access forbidden for MailerLite operation {action_name}. Check API key scopes."
+            }
+        elif status == 404:
+            return {
+                "status": "error",
+                "code": "NOT_FOUND",
+                "message": f"MailerLite resource not found on {action_name}: {err_msg}"
+            }
+        return {
+            "status": "error",
+            "code": f"HTTP_{status}",
+            "message": f"MailerLite {action_name} failed with HTTP {status}: {err_msg}"
+        }
+
+    async def ping(self) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.get(f"{self.base_url}/me", headers=self.headers)
-                if resp.status_code in (200, 201): return resp.json()
-                return {"status": "connected", "verified": True}
-            except Exception:
-                return {"status": "verified", "base_url": self.base_url}
+                resp = await client.get(f"{self.base_url}/subscribers?limit=1", headers=self.headers)
+                if resp.status_code == 200:
+                    return {"status": "ok", "authenticated": True}
+                return self._classify_error(resp, "ping")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
     async def list_subscribers(self, limit: int = 50, cursor: str = "") -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": min(limit, 100)}
+        if cursor:
+            params["cursor"] = cursor
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.get(f"{self.base_url}/subscribers", headers=self.headers, params={"limit": limit, "cursor": cursor})
-                if resp.status_code == 200: return resp.json()
-                return {"items": [], "total": 0}
-            except Exception:
-                return {"items": [], "total": 0}
+                resp = await client.get(f"{self.base_url}/subscribers", headers=self.headers, params=params)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    data = body.get("data", [])
+                    meta = body.get("meta", {})
+                    return {"items": data, "total": meta.get("total", len(data)), "next_cursor": meta.get("next_cursor")}
+                return self._classify_error(resp, "list_subscribers")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def get_subscriber(self, item_id: str) -> dict[str, Any]:
+    async def get_subscriber(self, subscriber_id: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.get(f"{self.base_url}/subscribers/{item_id}", headers=self.headers)
-                if resp.status_code == 200: return resp.json()
-                return {"id": item_id, "name": f"subscriber {item_id}", "status": "active"}
-            except Exception:
-                return {"id": item_id, "name": f"subscriber {item_id}", "status": "active"}
+                resp = await client.get(f"{self.base_url}/subscribers/{subscriber_id}", headers=self.headers)
+                if resp.status_code == 200:
+                    return resp.json().get("data", {})
+                return self._classify_error(resp, "get_subscriber")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def create_subscriber(self, name: str, details: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        payload = {"name": name, **(details or {})}
+    async def create_subscriber(self, email: str, fields: Optional[dict[str, Any]] = None, groups: Optional[list[str]] = None, status: str = "active") -> dict[str, Any]:
+        payload: dict[str, Any] = {"email": email, "status": status}
+        if fields: payload["fields"] = fields
+        if groups: payload["groups"] = groups
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
                 resp = await client.post(f"{self.base_url}/subscribers", headers=self.headers, json=payload)
-                if resp.status_code in (200, 201): return resp.json()
-                return {"id": f"new_subscriber", **payload}
-            except Exception:
-                return {"id": f"new_subscriber", **payload}
+                if resp.status_code in (200, 201):
+                    return resp.json().get("data", {})
+                return self._classify_error(resp, "create_subscriber")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def update_subscriber(self, item_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    async def update_subscriber(self, subscriber_id: str, fields: Optional[dict[str, Any]] = None, status: Optional[str] = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if fields: payload["fields"] = fields
+        if status: payload["status"] = status
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.patch(f"{self.base_url}/subscribers/{item_id}", headers=self.headers, json=fields)
-                if resp.status_code in (200, 204): return {"id": item_id, **fields}
-                return {"id": item_id, **fields}
-            except Exception:
-                return {"id": item_id, **fields}
+                resp = await client.put(f"{self.base_url}/subscribers/{subscriber_id}", headers=self.headers, json=payload)
+                if resp.status_code == 200:
+                    return resp.json().get("data", {})
+                return self._classify_error(resp, "update_subscriber")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def delete_subscriber(self, item_id: str) -> bool:
+    async def delete_subscriber(self, subscriber_id: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.delete(f"{self.base_url}/subscribers/{item_id}", headers=self.headers)
-                return resp.status_code in (200, 204)
-            except Exception:
-                return True
+                resp = await client.delete(f"{self.base_url}/subscribers/{subscriber_id}", headers=self.headers)
+                if resp.status_code in (200, 204):
+                    return {"status": "deleted", "id": subscriber_id}
+                return self._classify_error(resp, "delete_subscriber")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
     async def list_campaigns(self, limit: int = 50, cursor: str = "") -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": min(limit, 100)}
+        if cursor: params["cursor"] = cursor
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.get(f"{self.base_url}/campaigns", headers=self.headers, params={"limit": limit, "cursor": cursor})
-                if resp.status_code == 200: return resp.json()
-                return {"items": [], "total": 0}
-            except Exception:
-                return {"items": [], "total": 0}
+                resp = await client.get(f"{self.base_url}/campaigns", headers=self.headers, params=params)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    data = body.get("data", [])
+                    return {"items": data, "total": len(data)}
+                return self._classify_error(resp, "list_campaigns")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def get_campaign(self, item_id: str) -> dict[str, Any]:
+    async def get_campaign(self, campaign_id: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.get(f"{self.base_url}/campaigns/{item_id}", headers=self.headers)
-                if resp.status_code == 200: return resp.json()
-                return {"id": item_id, "name": f"campaign {item_id}", "status": "active"}
-            except Exception:
-                return {"id": item_id, "name": f"campaign {item_id}", "status": "active"}
+                resp = await client.get(f"{self.base_url}/campaigns/{campaign_id}", headers=self.headers)
+                if resp.status_code == 200:
+                    return resp.json().get("data", {})
+                return self._classify_error(resp, "get_campaign")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def create_campaign(self, name: str, details: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        payload = {"name": name, **(details or {})}
+    async def create_campaign(self, name: str, subject: str = "", groups: Optional[list[str]] = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": name, "type": "regular"}
+        if subject: payload["emails"] = [{"subject": subject, "from_name": "Team"}]
+        if groups: payload["groups"] = groups
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
                 resp = await client.post(f"{self.base_url}/campaigns", headers=self.headers, json=payload)
-                if resp.status_code in (200, 201): return resp.json()
-                return {"id": f"new_campaign", **payload}
-            except Exception:
-                return {"id": f"new_campaign", **payload}
+                if resp.status_code in (200, 201):
+                    return resp.json().get("data", {})
+                return self._classify_error(resp, "create_campaign")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def update_campaign(self, item_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    async def delete_campaign(self, campaign_id: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.patch(f"{self.base_url}/campaigns/{item_id}", headers=self.headers, json=fields)
-                if resp.status_code in (200, 204): return {"id": item_id, **fields}
-                return {"id": item_id, **fields}
-            except Exception:
-                return {"id": item_id, **fields}
+                resp = await client.delete(f"{self.base_url}/campaigns/{campaign_id}", headers=self.headers)
+                if resp.status_code in (200, 204):
+                    return {"status": "deleted", "id": campaign_id}
+                return self._classify_error(resp, "delete_campaign")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def delete_campaign(self, item_id: str) -> bool:
+    async def list_groups(self, limit: int = 50) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.delete(f"{self.base_url}/campaigns/{item_id}", headers=self.headers)
-                return resp.status_code in (200, 204)
-            except Exception:
-                return True
+                resp = await client.get(f"{self.base_url}/groups", headers=self.headers, params={"limit": limit})
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return {"items": body.get("data", [])}
+                return self._classify_error(resp, "list_groups")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def list_lists(self, limit: int = 50, cursor: str = "") -> dict[str, Any]:
+    async def list_segments(self, limit: int = 50) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.get(f"{self.base_url}/lists", headers=self.headers, params={"limit": limit, "cursor": cursor})
-                if resp.status_code == 200: return resp.json()
-                return {"items": [], "total": 0}
-            except Exception:
-                return {"items": [], "total": 0}
+                resp = await client.get(f"{self.base_url}/segments", headers=self.headers, params={"limit": limit})
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return {"items": body.get("data", [])}
+                return self._classify_error(resp, "list_segments")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def get_list(self, item_id: str) -> dict[str, Any]:
+    async def list_automations(self, limit: int = 50) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.get(f"{self.base_url}/lists/{item_id}", headers=self.headers)
-                if resp.status_code == 200: return resp.json()
-                return {"id": item_id, "name": f"list {item_id}", "status": "active"}
-            except Exception:
-                return {"id": item_id, "name": f"list {item_id}", "status": "active"}
+                resp = await client.get(f"{self.base_url}/automations", headers=self.headers, params={"limit": limit})
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return {"items": body.get("data", [])}
+                return self._classify_error(resp, "list_automations")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
 
-    async def create_list(self, name: str, details: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        payload = {"name": name, **(details or {})}
+    async def list_templates(self, limit: int = 50) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                resp = await client.post(f"{self.base_url}/lists", headers=self.headers, json=payload)
-                if resp.status_code in (200, 201): return resp.json()
-                return {"id": f"new_list", **payload}
-            except Exception:
-                return {"id": f"new_list", **payload}
-
-    async def update_list(self, item_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.patch(f"{self.base_url}/lists/{item_id}", headers=self.headers, json=fields)
-                if resp.status_code in (200, 204): return {"id": item_id, **fields}
-                return {"id": item_id, **fields}
-            except Exception:
-                return {"id": item_id, **fields}
-
-    async def delete_list(self, item_id: str) -> bool:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.delete(f"{self.base_url}/lists/{item_id}", headers=self.headers)
-                return resp.status_code in (200, 204)
-            except Exception:
-                return True
-
-    async def list_segments(self, limit: int = 50, cursor: str = "") -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.get(f"{self.base_url}/segments", headers=self.headers, params={"limit": limit, "cursor": cursor})
-                if resp.status_code == 200: return resp.json()
-                return {"items": [], "total": 0}
-            except Exception:
-                return {"items": [], "total": 0}
-
-    async def get_segment(self, item_id: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.get(f"{self.base_url}/segments/{item_id}", headers=self.headers)
-                if resp.status_code == 200: return resp.json()
-                return {"id": item_id, "name": f"segment {item_id}", "status": "active"}
-            except Exception:
-                return {"id": item_id, "name": f"segment {item_id}", "status": "active"}
-
-    async def create_segment(self, name: str, details: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        payload = {"name": name, **(details or {})}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.post(f"{self.base_url}/segments", headers=self.headers, json=payload)
-                if resp.status_code in (200, 201): return resp.json()
-                return {"id": f"new_segment", **payload}
-            except Exception:
-                return {"id": f"new_segment", **payload}
-
-    async def update_segment(self, item_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.patch(f"{self.base_url}/segments/{item_id}", headers=self.headers, json=fields)
-                if resp.status_code in (200, 204): return {"id": item_id, **fields}
-                return {"id": item_id, **fields}
-            except Exception:
-                return {"id": item_id, **fields}
-
-    async def delete_segment(self, item_id: str) -> bool:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.delete(f"{self.base_url}/segments/{item_id}", headers=self.headers)
-                return resp.status_code in (200, 204)
-            except Exception:
-                return True
-
-    async def list_templates(self, limit: int = 50, cursor: str = "") -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.get(f"{self.base_url}/templates", headers=self.headers, params={"limit": limit, "cursor": cursor})
-                if resp.status_code == 200: return resp.json()
-                return {"items": [], "total": 0}
-            except Exception:
-                return {"items": [], "total": 0}
-
-    async def get_template(self, item_id: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.get(f"{self.base_url}/templates/{item_id}", headers=self.headers)
-                if resp.status_code == 200: return resp.json()
-                return {"id": item_id, "name": f"template {item_id}", "status": "active"}
-            except Exception:
-                return {"id": item_id, "name": f"template {item_id}", "status": "active"}
-
-    async def create_template(self, name: str, details: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        payload = {"name": name, **(details or {})}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.post(f"{self.base_url}/templates", headers=self.headers, json=payload)
-                if resp.status_code in (200, 201): return resp.json()
-                return {"id": f"new_template", **payload}
-            except Exception:
-                return {"id": f"new_template", **payload}
-
-    async def update_template(self, item_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.patch(f"{self.base_url}/templates/{item_id}", headers=self.headers, json=fields)
-                if resp.status_code in (200, 204): return {"id": item_id, **fields}
-                return {"id": item_id, **fields}
-            except Exception:
-                return {"id": item_id, **fields}
-
-    async def delete_template(self, item_id: str) -> bool:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.delete(f"{self.base_url}/templates/{item_id}", headers=self.headers)
-                return resp.status_code in (200, 204)
-            except Exception:
-                return True
-
-    async def list_automations(self, limit: int = 50, cursor: str = "") -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.get(f"{self.base_url}/automations", headers=self.headers, params={"limit": limit, "cursor": cursor})
-                if resp.status_code == 200: return resp.json()
-                return {"items": [], "total": 0}
-            except Exception:
-                return {"items": [], "total": 0}
-
-    async def get_automation(self, item_id: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.get(f"{self.base_url}/automations/{item_id}", headers=self.headers)
-                if resp.status_code == 200: return resp.json()
-                return {"id": item_id, "name": f"automation {item_id}", "status": "active"}
-            except Exception:
-                return {"id": item_id, "name": f"automation {item_id}", "status": "active"}
-
-    async def create_automation(self, name: str, details: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        payload = {"name": name, **(details or {})}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.post(f"{self.base_url}/automations", headers=self.headers, json=payload)
-                if resp.status_code in (200, 201): return resp.json()
-                return {"id": f"new_automation", **payload}
-            except Exception:
-                return {"id": f"new_automation", **payload}
-
-    async def update_automation(self, item_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.patch(f"{self.base_url}/automations/{item_id}", headers=self.headers, json=fields)
-                if resp.status_code in (200, 204): return {"id": item_id, **fields}
-                return {"id": item_id, **fields}
-            except Exception:
-                return {"id": item_id, **fields}
-
-    async def delete_automation(self, item_id: str) -> bool:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.delete(f"{self.base_url}/automations/{item_id}", headers=self.headers)
-                return resp.status_code in (200, 204)
-            except Exception:
-                return True
+                resp = await client.get(f"{self.base_url}/templates", headers=self.headers, params={"limit": limit})
+                if resp.status_code == 200:
+                    body = resp.json()
+                    return {"items": body.get("data", [])}
+                return self._classify_error(resp, "list_templates")
+            except Exception as e:
+                return {"status": "error", "code": "NETWORK_ERROR", "message": self._sanitize_msg(str(e))}
