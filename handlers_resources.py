@@ -19,7 +19,7 @@ async def list_subscribers(params: ListSubscriberParams, ctx) -> ActionResult:
             rid = str(r.get("id") or r.get("key") or r.get("uuid") or "unknown")
             rname = r.get("name") or r.get("title") or r.get("label") or rid
             items.append({"id": rid, "name": rname, "status": r.get("status"), "created_at": r.get("createdAt") or r.get("created_at"), "raw": r})
-        return ActionResult.ok({"subscribers": items, "total": len(items)}, summary=f"Found {len(items)} subscribers.")
+        return ActionResult.success({"subscribers": items, "total": len(items)}, summary=f"Found {len(items)} subscribers.")
     except Exception as e:
         return ActionResult.error(f"Error listing subscribers: {e}")
 
@@ -30,7 +30,7 @@ async def get_subscriber(params: GetSubscriberParams, ctx) -> ActionResult:
         r = await client.get_subscriber(params.subscriber_id)
         rid = str(r.get("id") or params.subscriber_id)
         rname = r.get("name") or r.get("title") or rid
-        return ActionResult.ok({"id": rid, "name": rname, "status": r.get("status"), "created_at": r.get("createdAt") or r.get("created_at"), "raw": r}, summary=f"Retrieved Subscriber {rid}.")
+        return ActionResult.success({"id": rid, "name": rname, "status": r.get("status"), "created_at": r.get("createdAt") or r.get("created_at"), "raw": r}, summary=f"Retrieved Subscriber {rid}.")
     except Exception as e:
         return ActionResult.error(f"Error retrieving Subscriber: {e}")
 
@@ -39,7 +39,7 @@ async def audit_subscriber_health(params: ConnectionIdParams, ctx) -> ActionResu
     client = await resolve_client(ctx, params.connection_id)
     try:
         items = await client.list_subscribers(limit=50)
-        return ActionResult.ok({
+        return ActionResult.success({
             "healthy": True,
             "total_subscribers": len(items),
             "details": {"sample_count": len(items)},
