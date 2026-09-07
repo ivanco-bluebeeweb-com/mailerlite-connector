@@ -10,7 +10,7 @@ from schemas import (
 from handlers_connection import resolve_client
 
 @chat.function("list_subscribers", "List subscribers in MailerLite.", action_type="read", chain_callable=True, event="mailerlite-connector.list_subscribers", effects=["read:subscribers"], data_model=SubscriberList)
-async def list_subscribers(params: ListSubscriberParams, ctx) -> ActionResult:
+async def list_subscribers(ctx, params: ListSubscriberParams) -> ActionResult:
     client = await resolve_client(ctx, params.connection_id)
     try:
         raw_items = await client.list_subscribers(limit=params.limit)
@@ -24,7 +24,7 @@ async def list_subscribers(params: ListSubscriberParams, ctx) -> ActionResult:
         return ActionResult.error(f"Error listing subscribers: {e}")
 
 @chat.function("get_subscriber", "Get details of one Subscriber in MailerLite.", action_type="read", chain_callable=True, event="mailerlite-connector.get_subscriber", effects=["read:subscriber"], data_model=SubscriberRecord)
-async def get_subscriber(params: GetSubscriberParams, ctx) -> ActionResult:
+async def get_subscriber(ctx, params: GetSubscriberParams) -> ActionResult:
     client = await resolve_client(ctx, params.connection_id)
     try:
         r = await client.get_subscriber(params.subscriber_id)
@@ -35,7 +35,7 @@ async def get_subscriber(params: GetSubscriberParams, ctx) -> ActionResult:
         return ActionResult.error(f"Error retrieving Subscriber: {e}")
 
 @chat.function("audit_subscriber_health", "Audit health of MailerLite subscribers and connectivity.", action_type="read", chain_callable=True, event="mailerlite-connector.audit_subscriber_health", effects=["read:audit"], data_model=AuditHealthReport)
-async def audit_subscriber_health(params: ConnectionIdParams, ctx) -> ActionResult:
+async def audit_subscriber_health(ctx, params: ConnectionIdParams) -> ActionResult:
     client = await resolve_client(ctx, params.connection_id)
     try:
         items = await client.list_subscribers(limit=50)
